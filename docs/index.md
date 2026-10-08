@@ -7,6 +7,7 @@
 - [Testing](development/testing.md)
 - [Debugging](development/debugging.md)
 - [Create-or-queue task API](development/create-or-queue-api.md)
+- [Outbound webhooks](development/outbound-webhooks.md)
 - [Slack setup](development/slack-setup.md)
 
 ## Architecture

@@ -186,7 +186,7 @@ const bootstrap = async (): Promise<void> => {
     operationalLogger
   );
   const scheduler = new SchedulerService(taskStore, taskQueueStore, settingsStore, spawner);
-  const webhookDeliveryService = new WebhookDeliveryService(webhookDeliveryStore, repositoryStore, operationalLogger);
+  const webhookDeliveryService = new WebhookDeliveryService(webhookDeliveryStore, repositoryStore, taskStore, operationalLogger);
 
   await roleStore.ensureDefaultAdminRole();
   await userStore.ensureDefaultAdminUser({

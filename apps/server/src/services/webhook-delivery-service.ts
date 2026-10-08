@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import type { RealtimeEvent, Repository, Task } from "@verft/shared-types";
 import type { OperationalLogger } from "../lib/operational-logger.js";
 import type { RepositoryStore } from "./repository-store.js";
+import type { TaskStore } from "./task-store.js";
 import type { WebhookDeliveryStore, WebhookEventType, WebhookJob } from "./webhook-delivery-store.js";
 
 const WEBHOOK_PROCESS_INTERVAL_MS = 1_000;
@@ -31,6 +32,7 @@ export class WebhookDeliveryService {
   constructor(
     private readonly webhookDeliveryStore: WebhookDeliveryStore,
     private readonly repositoryStore: RepositoryStore,
+    private readonly taskStore: TaskStore,
     private readonly logger?: OperationalLogger
   ) {}
 
@@ -50,6 +52,48 @@ export class WebhookDeliveryService {
   }
 
   async handleRealtimeEvent(event: RealtimeEvent): Promise<void> {
+    if (event.type === "task:run_updated") {
+      const run = event.payload;
+      if (run.status === "running") {
+        return;
+      }
+      const task = await this.taskStore.getTask(run.taskId);
+      if (!task) {
+        this.logger?.warn("webhook", "webhook.delivery.dropped", "Webhook delivery dropped", {
+          eventType: "run_finished",
+          taskId: run.taskId,
+          runId: run.id,
+          reason: "missing_task"
+        });
+        return;
+      }
+      const queued = await this.webhookDeliveryStore.enqueueFinishedRunOnce(run.id, {
+        repositoryId: task.repoId,
+        eventType: "run_finished",
+        payload: {
+          run: {
+            id: run.id,
+            taskId: run.taskId,
+            action: run.action,
+            status: run.status,
+            finishedAt: run.finishedAt,
+            branchName: run.branchName,
+            finalMessage: run.summary,
+            errorMessage: run.errorMessage
+          }
+        }
+      });
+      if (queued) {
+        this.logger?.info("webhook", "webhook.delivery.queued", "Webhook delivery queued", {
+          eventType: "run_finished",
+          repositoryId: task.repoId,
+          taskId: run.taskId,
+          runId: run.id
+        });
+      }
+      return;
+    }
+
     if (event.type === "task:created") {
       await this.webhookDeliveryStore.enqueueJob({
         repositoryId: event.payload.repoId,

@@ -236,6 +236,8 @@ Checkpoint mutation, push/merge, attachments, terminal control, and summarizatio
 
 External automation can create or continue a task with `POST /api/tasks/create-or-queue` using a Verft personal access token. See [Create-or-Queue Task API](docs/development/create-or-queue-api.md) for request shape, scopes, curl examples, and a GitHub Actions example.
 
+Repositories can send signed outbound webhooks, including a `run_finished` event with each run's final message. See [Outbound Webhooks](docs/development/outbound-webhooks.md) for the payload and signature format.
+
 ## Common Commands
 
 | Command | Description |

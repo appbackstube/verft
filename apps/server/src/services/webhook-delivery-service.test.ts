@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { afterEach, describe, it } from "node:test";
-import type { RealtimeEvent, Repository, Task } from "@verft/shared-types";
+import type { RealtimeEvent, Repository, Task, TaskRun } from "@verft/shared-types";
 import { RedisWebhookDeliveryStore } from "./webhook-delivery-store.js";
 import { WebhookDeliveryService } from "./webhook-delivery-service.js";
 
@@ -24,6 +25,25 @@ class FakeRedis {
 
   async get(key: string): Promise<string | null> {
     return this.kv.get(key) ?? null;
+  }
+
+  async eval(
+    _script: string,
+    _keyCount: number,
+    markerKey: string,
+    jobKey: string,
+    queueKey: string,
+    deliveryId: string,
+    jobJson: string,
+    dueAt: number
+  ): Promise<number> {
+    if (this.kv.has(markerKey)) {
+      return 0;
+    }
+    this.kv.set(markerKey, deliveryId);
+    this.kv.set(jobKey, jobJson);
+    this.getZset(queueKey).set(deliveryId, dueAt);
+    return 1;
   }
 
   async del(...keys: string[]): Promise<number> {
@@ -168,6 +188,23 @@ const baseRepository = (): Repository => ({
   updatedAt: "2026-01-01T00:00:00.000Z"
 });
 
+const baseRun = (overrides: Partial<TaskRun> = {}): TaskRun => ({
+  id: "run-1",
+  taskId: "task-1",
+  action: "build",
+  provider: "codex",
+  providerProfile: "medium",
+  modelOverride: null,
+  branchName: "verft/task-1",
+  status: "succeeded",
+  startedAt: "2026-01-01T00:00:00.000Z",
+  finishedAt: "2026-01-01T00:01:00.000Z",
+  summary: "Final answer",
+  errorMessage: null,
+  logs: [],
+  ...overrides
+});
+
 describe("WebhookDeliveryService", () => {
   const originalFetch = globalThis.fetch;
 
@@ -200,7 +237,7 @@ describe("WebhookDeliveryService", () => {
 
     const store = new RedisWebhookDeliveryStore(redis as never);
     const event: RealtimeEvent = { type: "task:created", payload: baseTask() };
-    const service = new WebhookDeliveryService(store, repositoryStore as never);
+    const service = new WebhookDeliveryService(store, repositoryStore as never, {} as never);
     await service.handleRealtimeEvent(event);
     await (service as unknown as { processDueJobs: () => Promise<void> }).processDueJobs();
 
@@ -220,7 +257,7 @@ describe("WebhookDeliveryService", () => {
       recordWebhookDeliveryResult: async () => null
     };
     const store = new RedisWebhookDeliveryStore(redis as never);
-    const service = new WebhookDeliveryService(store, repositoryStore as never);
+    const service = new WebhookDeliveryService(store, repositoryStore as never, {} as never);
     const task = baseTask();
 
     await service.handleRealtimeEvent({ type: "task:created", payload: task });
@@ -236,5 +273,88 @@ describe("WebhookDeliveryService", () => {
 
     const queued = await redis.zrangebyscore("verft:webhook_delivery_queue", 0, Number.MAX_SAFE_INTEGER);
     assert.equal(queued.length, 2);
+  });
+
+  it("queues one run_finished event per terminal run, including later runs on the same task", async () => {
+    const redis = new FakeRedis();
+    const store = new RedisWebhookDeliveryStore(redis as never);
+    const service = new WebhookDeliveryService(
+      store,
+      {} as never,
+      { getTask: async () => baseTask() } as never
+    );
+
+    await service.handleRealtimeEvent({ type: "task:run_updated", payload: baseRun({ status: "running", finishedAt: null, summary: null }) });
+    const runs = [
+      baseRun(),
+      baseRun({ id: "run-2", action: "ask", summary: "The answer is 42." }),
+      baseRun({ id: "run-3", status: "failed", summary: null, errorMessage: "Agent failed" }),
+      baseRun({ id: "run-4", status: "cancelled", summary: "Task cancelled by user." })
+    ];
+    for (const run of runs) {
+      await service.handleRealtimeEvent({ type: "task:run_updated", payload: run });
+      await service.handleRealtimeEvent({ type: "task:run_updated", payload: { ...run, hasRawJson: true } });
+    }
+
+    const queuedIds = await redis.zrangebyscore("verft:webhook_delivery_queue", 0, Number.MAX_SAFE_INTEGER);
+    assert.equal(queuedIds.length, 4);
+    const jobs = await Promise.all(queuedIds.map((id) => store.getJob(id)));
+    assert.deepEqual(jobs.map((job) => job?.eventType), ["run_finished", "run_finished", "run_finished", "run_finished"]);
+    assert.deepEqual(jobs.map((job) => job?.repositoryId), ["repo-1", "repo-1", "repo-1", "repo-1"]);
+    assert.deepEqual(jobs.map((job) => job?.payload.run), runs.map((run) => ({
+      id: run.id,
+      taskId: run.taskId,
+      action: run.action,
+      status: run.status,
+      finishedAt: run.finishedAt,
+      branchName: run.branchName,
+      finalMessage: run.summary,
+      errorMessage: run.errorMessage
+    })));
+  });
+
+  it("signs and retries run_finished deliveries", async () => {
+    const redis = new FakeRedis();
+    const store = new RedisWebhookDeliveryStore(redis as never);
+    const repositoryStore = {
+      getRepositoryWebhookTarget: async () => ({
+        repository: baseRepository(),
+        webhookUrl: "https://example.com/webhook",
+        webhookSecret: "super-secret"
+      }),
+      recordWebhookDeliveryResult: async () => baseRepository()
+    };
+    const service = new WebhookDeliveryService(
+      store,
+      repositoryStore as never,
+      { getTask: async () => baseTask() } as never
+    );
+    const fetchCalls: Array<{ headers: Record<string, string>; body: string }> = [];
+    globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+      fetchCalls.push({ headers: init?.headers as Record<string, string>, body: init?.body as string });
+      return new Response("ok", { status: fetchCalls.length === 1 ? 503 : 200 });
+    }) as typeof fetch;
+
+    await service.handleRealtimeEvent({ type: "task:run_updated", payload: baseRun() });
+    await (service as unknown as { processDueJobs: () => Promise<void> }).processDueJobs();
+    const [deliveryId] = await redis.zrangebyscore("verft:webhook_delivery_queue", 0, Number.MAX_SAFE_INTEGER);
+    assert.ok(deliveryId);
+    assert.equal((await store.getJob(deliveryId))?.attempt, 2);
+    await redis.zadd("verft:webhook_delivery_queue", Date.now() - 1, deliveryId);
+    await (service as unknown as { processDueJobs: () => Promise<void> }).processDueJobs();
+
+    assert.equal(fetchCalls.length, 2);
+    assert.equal(fetchCalls[0]?.headers["x-verft-event"], "run_finished");
+    assert.equal(fetchCalls[0]?.headers["x-verft-delivery-id"], deliveryId);
+    assert.equal(fetchCalls[1]?.headers["x-verft-delivery-id"], deliveryId);
+    for (const call of fetchCalls) {
+      const timestamp = call.headers["x-verft-timestamp"];
+      const expectedSignature = createHmac("sha256", "super-secret")
+        .update(`${timestamp}.${call.body}`)
+        .digest("hex");
+      assert.equal(call.headers["x-verft-signature"], `sha256=${expectedSignature}`);
+      assert.equal((JSON.parse(call.body) as { payload: { run: { finalMessage: string } } }).payload.run.finalMessage, "Final answer");
+    }
+    assert.deepEqual(await redis.zrangebyscore("verft:webhook_delivery_queue", 0, Number.MAX_SAFE_INTEGER), []);
   });
 });

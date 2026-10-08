@@ -4,8 +4,18 @@ import type Redis from "ioredis";
 const WEBHOOK_QUEUE_KEY = "verft:webhook_delivery_queue";
 const WEBHOOK_JOB_KEY_PREFIX = "verft:webhook_delivery:";
 const WEBHOOK_LAST_TASK_STATUS_KEY_PREFIX = "verft:webhook_task_status:";
+const WEBHOOK_FINISHED_RUN_KEY_PREFIX = "verft:webhook_finished_run:";
 
-export type WebhookEventType = "created" | "updated" | "deleted" | "pushed" | "merged";
+const ENQUEUE_ONCE_SCRIPT = `
+  if redis.call("SET", KEYS[1], ARGV[1], "NX") then
+    redis.call("SET", KEYS[2], ARGV[2])
+    redis.call("ZADD", KEYS[3], ARGV[3], ARGV[1])
+    return 1
+  end
+  return 0
+`;
+
+export type WebhookEventType = "created" | "updated" | "deleted" | "pushed" | "merged" | "run_finished";
 
 export interface WebhookJob {
   id: string;
@@ -17,6 +27,7 @@ export interface WebhookJob {
 
 export interface WebhookDeliveryStore {
   enqueueJob(job: Omit<WebhookJob, "id" | "attempt">): Promise<void>;
+  enqueueFinishedRunOnce(runId: string, job: Omit<WebhookJob, "id" | "attempt">): Promise<boolean>;
   getLastTaskStatus(taskId: string): Promise<string | null>;
   setLastTaskStatus(taskId: string, status: string): Promise<void>;
   clearLastTaskStatus(taskId: string): Promise<void>;
@@ -46,6 +57,21 @@ export class RedisWebhookDeliveryStore implements WebhookDeliveryStore {
       attempt: 1
     };
     await this.redis.multi().set(this.jobKey(queued.id), JSON.stringify(queued)).zadd(WEBHOOK_QUEUE_KEY, Date.now(), queued.id).exec();
+  }
+
+  async enqueueFinishedRunOnce(runId: string, job: Omit<WebhookJob, "id" | "attempt">): Promise<boolean> {
+    const queued: WebhookJob = { ...job, id: randomUUID(), attempt: 1 };
+    const result = await this.redis.eval(
+      ENQUEUE_ONCE_SCRIPT,
+      3,
+      `${WEBHOOK_FINISHED_RUN_KEY_PREFIX}${runId}`,
+      this.jobKey(queued.id),
+      WEBHOOK_QUEUE_KEY,
+      queued.id,
+      JSON.stringify(queued),
+      Date.now()
+    );
+    return result === 1;
   }
 
   async getLastTaskStatus(taskId: string): Promise<string | null> {
@@ -79,7 +105,8 @@ export class RedisWebhookDeliveryStore implements WebhookDeliveryStore {
           job.eventType === "updated" ||
           job.eventType === "deleted" ||
           job.eventType === "pushed" ||
-          job.eventType === "merged") &&
+          job.eventType === "merged" ||
+          job.eventType === "run_finished") &&
         typeof job.attempt === "number" &&
         job.payload &&
         typeof job.payload === "object"
